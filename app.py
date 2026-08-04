@@ -361,21 +361,6 @@ def pct(n, d):
     return round(100 * n / d, 1) if d else None
 
 
-def retention_matrix(rows, group_col='course_group'):
-    out = []
-    for g, gdf in rows.groupby(group_col):
-        all_total, all_ret, all_ref = 0, 0, 0
-        for cat in ['Upfront', 'Non-Upfront', 'Flexipay']:
-            c = gdf[gdf['payment_category'] == cat]
-            total, retained, refunded = len(c), int(c['is_retained'].sum()), int(c['is_refunded'].sum())
-            all_total += total; all_ret += retained; all_ref += refunded
-            out.append({'Course': g, 'Category': cat, 'Total': total, 'Retained': retained,
-                        'Retained %': pct(retained, total), 'Refunded': refunded, 'Refund %': pct(refunded, total)})
-        out.append({'Course': g, 'Category': 'All categories', 'Total': all_total, 'Retained': all_ret,
-                    'Retained %': pct(all_ret, all_total), 'Refunded': all_ref, 'Refund %': pct(all_ref, all_total)})
-    return pd.DataFrame(out)
-
-
 def month_summary(rows):
     out = []
     for (course, month), g in rows.groupby(['course_group', 'cohort_month']):
@@ -388,29 +373,42 @@ def month_summary(rows):
     return pd.DataFrame(out).sort_values(['Course', 'Month']) if out else pd.DataFrame()
 
 
-def month_category_breakdown(rows):
+def month_category_wide(rows):
     out = []
-    for (course, month, cat), g in rows.groupby(['course_group', 'cohort_month', 'payment_category']):
-        if cat not in ('Upfront', 'Flexipay', 'Non-Upfront'):
-            continue
-        total = len(g)
-        out.append({
-            'Course': course, 'Month': month, 'Category': cat, 'Total': total,
-            'Retained': int(g['is_retained'].sum()), 'Retained %': pct(int(g['is_retained'].sum()), total),
-            'Refunded': int(g['is_refunded'].sum()), 'Refund %': pct(int(g['is_refunded'].sum()), total),
-        })
-    return pd.DataFrame(out).sort_values(['Course', 'Month', 'Category']) if out else pd.DataFrame()
+    for (course, month), g in rows.groupby(['course_group', 'cohort_month']):
+        row = {'Course': course, 'Month': month}
+        for cat in ['Upfront', 'Flexipay', 'Non-Upfront']:
+            c = g[g['payment_category'] == cat]
+            total = len(c)
+            retained = int(c['is_retained'].sum())
+            row[f'{cat} Total'] = total
+            row[f'{cat} Retained'] = retained
+            row[f'{cat} Retained %'] = pct(retained, total)
+            row[f'{cat} Refunded'] = int(c['is_refunded'].sum())
+        out.append(row)
+    return pd.DataFrame(out).sort_values(['Course', 'Month']) if out else pd.DataFrame()
 
 
 def program_segment_table(rows):
-    sub = rows[rows['course_group'].isin(['Agentic', 'LevelUp'])]
+    sub = rows[rows['course_group'].isin(['Agentic', 'LevelUp'])].copy()
+    if sub.empty:
+        return pd.DataFrame()
+
+    def label(r):
+        track = 'AI' if r['course_group'] == 'Agentic' else 'IP'
+        return f'Standalone {track}' if r['program_segment'] == 'Standalone' else f'Edgeup (Started {track})'
+
+    sub['segment_label'] = sub.apply(label, axis=1)
     out = []
-    for (course, segment), g in sub.groupby(['course_group', 'program_segment']):
+    for (course, segment), g in sub.groupby(['course_group', 'segment_label']):
         total = len(g)
         out.append({'Course': course, 'Segment': segment, 'Total': total,
                     'Retained': int(g['is_retained'].sum()), 'Retained %': pct(int(g['is_retained'].sum()), total),
                     'Refunded': int(g['is_refunded'].sum())})
-    return pd.DataFrame(out).sort_values(['Course', 'Segment']) if out else pd.DataFrame()
+    order = ['Standalone AI', 'Edgeup (Started AI)', 'Standalone IP', 'Edgeup (Started IP)']
+    df = pd.DataFrame(out)
+    df['_o'] = df['Segment'].apply(lambda s: order.index(s) if s in order else 99)
+    return df.sort_values(['Course', '_o']).drop(columns='_o') if not df.empty else df
 
 
 def payment_method_table(rows):
@@ -422,13 +420,18 @@ def payment_method_table(rows):
     return pd.DataFrame(out).sort_values(['Course', 'Total'], ascending=[True, False]) if out else pd.DataFrame()
 
 
-def heatmap_data(rows):
+def heatmap_data_by_course(rows, course):
     order = ["All 3", "Orientation & F", "O & F", "O & O", "First Class", "Orientation", "Onboarding", "None", "Unknown"]
+    sub = rows[rows['course_group'] == course]
+    if sub.empty:
+        return pd.DataFrame(), [], order
+    month_order = sub.groupby('cohort_month')['cohort_start_date'].min().sort_values().index.tolist()
     out = []
-    for (course, bucket), g in rows.groupby(['course_group', 'risk_bucket']):
+    for (month, bucket), g in sub.groupby(['cohort_month', 'risk_bucket']):
         total = len(g)
-        out.append({'course': course, 'bucket': bucket, 'n': total, 'retained_pct': pct(int(g['is_retained'].sum()), total), 'refunded': int(g['is_refunded'].sum())})
-    return pd.DataFrame(out), order
+        out.append({'month': month, 'bucket': bucket, 'n': total,
+                    'retained_pct': pct(int(g['is_retained'].sum()), total), 'refunded': int(g['is_refunded'].sum())})
+    return pd.DataFrame(out), month_order, order
 
 
 def subcat_counts(rows):
@@ -488,7 +491,7 @@ cards = [
 st.markdown(f'<div class="kpi-row">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 tabs = st.tabs([
-    "Cohort Summary", "Retention Matrix", "Cohort Calendar", "Refund Sub-categories",
+    "Cohort Summary", "Category Breakdown", "Trial Window (Refunds)", "Refund Sub-categories",
     "Refunds — Detail", "Active Cases", "Payment Method", "Engagement Heatmap",
 ])
 
@@ -497,10 +500,6 @@ with tabs[0]:
     st.subheader("Month-wise enrollments & refunds")
     data = month_summary(scoped)
     st.dataframe(data, use_container_width=True, hide_index=True)
-
-    st.markdown("**Payment category breakdown** _(Upfront / Flexipay / Non-Upfront, month-wise)_")
-    cat_data = month_category_breakdown(scoped)
-    st.dataframe(cat_data, use_container_width=True, hide_index=True)
 
     if not scoped.empty:
         chart_df = scoped.groupby('course_group').agg(
@@ -526,22 +525,28 @@ with tabs[0]:
 
     ai_insight(data.to_dict('records') if not data.empty else [], "cohort summary", "cohort")
 
-# ---- Retention Matrix ----
-with tabs[1]:
-    st.subheader("Retention matrix — Upfront / Non-Upfront / Flexipay / All")
-    data = retention_matrix(scoped)
-    st.dataframe(data, use_container_width=True, hide_index=True)
-    if not data.empty:
-        fig = px.bar(data[data['Category'] == 'All categories'], x='Course', y='Retained %',
-                     color='Retained %', color_continuous_scale=[RED, AMBER, GREEN], range_color=[60, 100])
-        fig.update_layout(height=340, margin=dict(t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    ai_insight(data.to_dict('records') if not data.empty else [], "retention matrix", "retention")
-
     seg = program_segment_table(scoped)
     if not seg.empty:
-        st.markdown("**Program segment — Agentic & LevelUp** _(Standalone vs. Edgeup learners who took both AI + IP, counted only under the program they started with)_")
+        st.markdown("**Program segment — Agentic & LevelUp** _(standalone vs. Edgeup learners who took both AI + IP, split by which program they started with)_")
         st.dataframe(seg, use_container_width=True, hide_index=True)
+
+# ---- Category Breakdown (month-wise) ----
+with tabs[1]:
+    st.subheader("Upfront / Flexipay / Non-Upfront — month-wise")
+    data = month_category_wide(scoped)
+    st.dataframe(data, use_container_width=True, hide_index=True)
+
+    if not scoped.empty:
+        pie_df = scoped['payment_category'].value_counts().reset_index()
+        pie_df.columns = ['Category', 'Count']
+        pie_df = pie_df[pie_df['Category'].isin(['Upfront', 'Flexipay', 'Non-Upfront'])]
+        fig = px.pie(pie_df, names='Category', values='Count', hole=0.45,
+                     color='Category', color_discrete_map={'Upfront': NAVY, 'Flexipay': AMBER, 'Non-Upfront': GREEN})
+        fig.update_traces(textinfo='label+percent')
+        fig.update_layout(height=360, margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    ai_insight(data.to_dict('records') if not data.empty else [], "category breakdown", "catwide")
 
     with st.expander(f"Show raw data ({len(scoped)} rows)"):
         st.dataframe(scoped[['hubspot_id', 'course_group', 'cohort_name', 'cohort_start_date',
@@ -549,21 +554,31 @@ with tabs[1]:
                               'program_segment', 'starting_track', 'engagement_level']],
                      use_container_width=True, hide_index=True)
 
-# ---- Cohort Calendar ----
+# ---- Trial Window (refunded learners only) ----
 with tabs[2]:
-    st.subheader("Cohort calendar — payment deadlines & trial window")
+    st.subheader("Trial window — refunded learners, course & cohort-wise")
+    ref_rows = scoped[scoped['is_refunded']]
     rows_ = []
-    for (course, cohort), g in scoped.groupby(['course_group', 'cohort_name']):
+    for (course, cohort), g in ref_rows.groupby(['course_group', 'cohort_name']):
+        yes = int((g['trial_window'] == 'Yes').sum())
+        no = int((g['trial_window'] == 'No').sum())
+        denom = yes + no
         rows_.append({
-            'Course': course, 'Cohort': cohort,
-            'Start': g['cohort_start_date'].iloc[0].date() if pd.notna(g['cohort_start_date'].iloc[0]) else None,
-            'Deadline': g['payment_deadline'].iloc[0].date() if pd.notna(g['payment_deadline'].iloc[0]) else None,
-            'Trial: Yes': int((g['trial_window'] == 'Yes').sum()),
-            'Trial: No': int((g['trial_window'] == 'No').sum()),
-            'Not Marked': int((g['trial_window'] == 'Not Marked').sum()),
+            'Course': course, 'Cohort': cohort, 'Total Refunds': len(g),
+            'Trial: Yes': yes, 'Yes %': pct(yes, denom),
+            'Trial: No': no, 'No %': pct(no, denom),
         })
-    cal_df = pd.DataFrame(rows_).sort_values('Deadline') if rows_ else pd.DataFrame()
-    st.dataframe(cal_df, use_container_width=True, hide_index=True)
+    trial_df = pd.DataFrame(rows_).sort_values(['Course', 'Cohort']) if rows_ else pd.DataFrame()
+    if trial_df.empty:
+        st.caption("No refunds in this window.")
+    else:
+        st.dataframe(trial_df, use_container_width=True, hide_index=True)
+        chart_src = ref_rows[ref_rows['trial_window'].isin(['Yes', 'No'])]
+        chart_agg = chart_src.groupby(['course_group', 'trial_window']).size().reset_index(name='Count')
+        fig = px.bar(chart_agg, x='course_group', y='Count', color='trial_window', barmode='group',
+                     color_discrete_map={'Yes': GREEN, 'No': RED}, labels={'course_group': 'Course', 'trial_window': 'Trial Window'})
+        fig.update_layout(height=340, margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
 
 # ---- Refund Sub-categories ----
 with tabs[3]:
@@ -602,8 +617,18 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("Payment method × retention")
     data = payment_method_table(scoped)
-    st.dataframe(data, use_container_width=True, hide_index=True)
-    if not data.empty:
+    if data.empty:
+        st.caption("No data in this window.")
+    else:
+        cols = st.columns(2)
+        for i, course in enumerate(COURSES):
+            sub = data[data['Course'] == course].drop(columns='Course')
+            with cols[i % 2]:
+                st.markdown(f"**{course}**")
+                if sub.empty:
+                    st.caption("No data in this window.")
+                else:
+                    st.dataframe(sub, use_container_width=True, hide_index=True)
         fig = px.bar(data, x='Method', y='Total', color='Course', barmode='group')
         fig.update_layout(height=340, margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
@@ -612,37 +637,35 @@ with tabs[6]:
 # ---- Engagement Heatmap ----
 with tabs[7]:
     st.subheader("Engagement category heatmap")
-    hdf, order = heatmap_data(scoped)
-    if hdf.empty:
-        st.caption("No data in this window.")
-    else:
-        courses = sorted(hdf['course'].unique())
-        pivot_pct = hdf.pivot(index='bucket', columns='course', values='retained_pct').reindex(order)
-        pivot_n = hdf.pivot(index='bucket', columns='course', values='n').reindex(order)
-        pivot_ref = hdf.pivot(index='bucket', columns='course', values='refunded').reindex(order)
+    st.caption("One heatmap per course, month-wise. Each cell: total learners (n), retained %, refund count for that engagement category.")
+    HEAT_SCALE = [[0, "#D9776B"], [0.5, "#E8B85E"], [1, "#4A9B87"]]
+
+    for course in COURSES:
+        hdf, month_order, order = heatmap_data_by_course(scoped, course)
+        if hdf.empty or not month_order:
+            continue
+        pivot_pct = hdf.pivot(index='bucket', columns='month', values='retained_pct').reindex(order).reindex(columns=month_order)
+        pivot_n = hdf.pivot(index='bucket', columns='month', values='n').reindex(order).reindex(columns=month_order)
+        pivot_ref = hdf.pivot(index='bucket', columns='month', values='refunded').reindex(order).reindex(columns=month_order)
 
         text_matrix = []
         for bucket in pivot_pct.index:
             row_text = []
-            for c in pivot_pct.columns:
-                n = pivot_n.loc[bucket, c]
-                p = pivot_pct.loc[bucket, c]
-                r = pivot_ref.loc[bucket, c]
-                if pd.isna(n):
-                    row_text.append("")
-                else:
-                    row_text.append(f"n={int(n)}<br>{p}% retained<br>{int(r)} refunded")
+            for m in pivot_pct.columns:
+                n = pivot_n.loc[bucket, m]
+                p = pivot_pct.loc[bucket, m]
+                r = pivot_ref.loc[bucket, m]
+                row_text.append("" if pd.isna(n) else f"n={int(n)}<br>{p}% retained<br>{int(r)} refunded")
             text_matrix.append(row_text)
 
         fig = go.Figure(data=go.Heatmap(
             z=pivot_pct.values, x=list(pivot_pct.columns), y=list(pivot_pct.index),
-            colorscale=[[0, RED], [0.5, AMBER], [1, GREEN]], zmin=0, zmax=100,
-            text=text_matrix, texttemplate="%{text}", textfont={"size": 12},
+            colorscale=HEAT_SCALE, zmin=0, zmax=100,
+            text=text_matrix, texttemplate="%{text}", textfont={"size": 11},
             hoverinfo='skip', showscale=False,
         ))
-        fig.update_layout(height=480, margin=dict(t=10, b=10))
+        fig.update_layout(height=max(320, 55 * len(pivot_pct.index)), margin=dict(t=30, b=10), title=course)
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Green = high retention, red = high refund risk. Each cell shows total learners (n), retained %, and refund count for that engagement category.")
 
 st.divider()
 with st.expander("Data notes / known limitations"):
