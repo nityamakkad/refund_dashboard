@@ -37,8 +37,9 @@ PAYMENT_MODE_MAP = {
     'ACH_TRANSFER': 'ACH', 'CLIMBCREDIT': 'Climb', 'STRIPE_CARD': 'Stripe',
     'STRIPE_MANUAL_PAYMENT': 'Stripe', 'PAYPAL': 'PayPal', 'KLARNA': 'Klarna',
     '0_PERCENT_APR_FLEXIPAY': 'Flexipay', '0% APR FLEXIPAY': 'Flexipay', 'Flexipay': 'Flexipay',
-    'BRAINTREE': 'Braintree', 'AFFIRM_VIA_STRIPE': 'Affirm', 'BANK_TRANSFER': 'Bank Transfer',
+    'BRAINTREE': 'Braintree', 'AFFIRM_VIA_STRIPE': 'Affirm', 'AFFIRM': 'Affirm', 'BANK_TRANSFER': 'Bank Transfer',
     'RAZORPAY_MANUAL_PAYMENT': 'Razorpay', 'Invalid': 'Unknown/Invalid', 'Not Updated': 'Unknown/Invalid',
+    'STRIPE_MANUAL_PAYMENT, 0_PERCENT_APR_FLEXIPAY': 'Stripe + Flexipay',
 }
 
 # Canonical column name -> acceptable header variants in the raw sheet (case/whitespace-insensitive)
@@ -247,7 +248,9 @@ def clean(df: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
     df['refund_date'] = refund_date
 
     df['payment_category'] = col('Status', 'Unknown').replace('', 'Unknown').fillna('Unknown')
-    df['payment_method_clean'] = col('Payment Mode').astype(str).str.strip().map(PAYMENT_MODE_MAP).fillna('Other')
+    _raw_pm = col('Payment Mode').fillna('').astype(str).str.strip()
+    df['payment_method_raw'] = _raw_pm
+    df['payment_method_clean'] = _raw_pm.map(PAYMENT_MODE_MAP).fillna(_raw_pm.where(_raw_pm != '', 'Not Marked'))
     df['is_refunded'] = col('Refunded', 'No').astype(str).str.strip() == 'Yes'
     df['trial_window'] = col('Trial Window', 'Not Marked').replace('', 'Not Marked').fillna('Not Marked')
     df['engagement_level'] = col('Engagement\n Level', 'Unknown Engagement').replace('', 'Unknown Engagement').fillna('Unknown Engagement')
@@ -318,6 +321,11 @@ with st.sidebar.expander("Data health check"):
     st.caption("If a course shows 0 rows or 'not found', its tab name or headers don't match — fix the tab name/header text in the Sheet rather than editing code.")
     if _crossover_removed:
         st.caption(f"{_crossover_removed} Edgeup (AI+IP) row(s) excluded from Agentic/LevelUp counts to avoid double-counting learners who took both — kept only under the course they started with.")
+    st.markdown("**Raw payment method values (column I), by course**")
+    pm_check = df_all.groupby(['course_group', 'payment_method_raw']).size().reset_index(name='rows')
+    pm_check = pm_check.sort_values(['course_group', 'rows'], ascending=[True, False])
+    st.dataframe(pm_check, hide_index=True, use_container_width=True)
+    st.caption("Blank/'Not Marked' rows mean column I is empty for that learner in the Sheet — that's a raw-data gap, not a code issue. Anything else shown here now appears on the Payment Method tab under its own exact label instead of being merged into 'Other'.")
 
 mode = st.sidebar.radio("View", ["Weekly", "Monthly"], horizontal=True)
 
