@@ -9,7 +9,7 @@ service account steps. Once secrets are configured, just run:
 """
 import json
 import re
-from datetime import date, timedelta, datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import numpy as np
@@ -23,11 +23,13 @@ from google.oauth2.service_account import Credentials
 # CONFIG — edit these to match your actual Google Sheet
 # ============================================================
 SHEET_URL_OR_KEY = st.secrets.get("SHEET_URL_OR_KEY", "")  # full URL or the sheet key
+# Worksheet tab names — match whatever your actual tabs are named (any case/spacing is fine,
+# this is just used to find the tab; data column matching below is separately tolerant too).
 WORKSHEET_NAMES = {
-    "Agentic": "Agentic",
-    "FDE": "FDE",
-    "Switch-Up": "Switch-Up",
-    "LevelUp": "LevelUp",
+    "Agentic": "agentic",
+    "FDE": "fde",
+    "Switch-Up": "flagship",
+    "LevelUp": "levelup",
 }
 CACHE_TTL_SECONDS = 300  # re-read Sheets at most every 5 minutes
 
@@ -39,7 +41,73 @@ PAYMENT_MODE_MAP = {
     'RAZORPAY_MANUAL_PAYMENT': 'Razorpay', 'Invalid': 'Unknown/Invalid', 'Not Updated': 'Unknown/Invalid',
 }
 
+# Canonical column name -> acceptable header variants in the raw sheet (case/whitespace-insensitive)
+COLUMN_ALIASES = {
+    'hubspot_id': ['hubspot_id', 'hubspot id'],
+    'cohort_name': ['cohort_name', 'cohort name'],
+    'cohort_start_date': ['cohort_start_date', 'cohort start date'],
+    'Payment\nDeadline': ['payment deadline', 'payment_deadline'],
+    'Refund date': ['refund date', 'refund_date'],
+    'Status': ['status'],
+    'Payment Mode': ['payment mode', 'payment_mode'],
+    'Refunded': ['refunded'],
+    'Trial Window': ['trial window', 'trial_window'],
+    'Engagement\n Level': ['engagement level', 'engagement_level'],
+    'High-Risk Flag': ['high-risk flag', 'high risk flag', 'highrisk flag'],
+    'Refund Category': ['refund category', 'refund_category'],
+    'Refund Reason': ['refund reason', 'refund_reason'],
+    'Refund \nJourney Stage': ['refund journey stage', 'refund_journey_stage'],
+    'Current Payment Status': ['current payment status', 'current_payment_status'],
+    'Agreement Signed Date': ['agreement signed date'],
+}
+
+NAVY, GREEN, AMBER, RED = "#0B2A4A", "#1E8E5A", "#D6971F", "#C63C3C"
+
 st.set_page_config(page_title="Refund & Retention Review", layout="wide")
+
+st.markdown("""
+<style>
+.kpi-row { display:flex; gap:14px; flex-wrap:wrap; margin: 4px 0 20px; }
+.kpi-card { flex:1; min-width:170px; background:#fff; border-radius:12px; padding:16px 20px;
+  border:1px solid #E1E4E9; box-shadow:0 1px 4px rgba(15,42,74,0.07); position:relative; overflow:hidden; }
+.kpi-card:before { content:""; position:absolute; left:0; top:0; bottom:0; width:5px; background:var(--accent,#0B2A4A); }
+.kpi-label { font-size:11px; letter-spacing:.5px; text-transform:uppercase; color:#6B7684; font-weight:700; }
+.kpi-value { font-size:32px; font-weight:800; margin-top:4px; font-variant-numeric:tabular-nums; line-height:1.1; }
+.kpi-sub { font-size:12px; color:#8A93A0; margin-top:3px; }
+</style>
+""", unsafe_allow_html=True)
+
+
+def norm_key(s: str) -> str:
+    return re.sub(r'[\s_]+', ' ', str(s)).strip().lower()
+
+
+ALIAS_TO_CANON = {norm_key(a): canon for canon, aliases in COLUMN_ALIASES.items() for a in aliases}
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {}
+    for c in df.columns:
+        key = norm_key(c)
+        if key in ALIAS_TO_CANON and ALIAS_TO_CANON[key] != c:
+            rename_map[c] = ALIAS_TO_CANON[key]
+    return df.rename(columns=rename_map)
+
+
+def kpi_card(label, value, color=NAVY, sub=""):
+    sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
+    return f'<div class="kpi-card" style="--accent:{color}"><div class="kpi-label">{label}</div><div class="kpi-value" style="color:{color}">{value}</div>{sub_html}</div>'
+
+
+def ret_color(p):
+    if p is None:
+        return "#9AA3AE"
+    if p >= 90:
+        return GREEN
+    if p >= 75:
+        return AMBER
+    return RED
+
 
 # ============================================================
 # DATA LOADING — Google Sheets -> clean DataFrame
@@ -60,19 +128,25 @@ def load_raw_from_sheets():
     sh = client.open_by_url(SHEET_URL_OR_KEY) if SHEET_URL_OR_KEY.startswith("http") \
         else client.open_by_key(SHEET_URL_OR_KEY)
     frames = []
+    load_report = []
     for course, ws_name in WORKSHEET_NAMES.items():
-        ws = sh.worksheet(ws_name)
+        try:
+            ws = sh.worksheet(ws_name)
+        except gspread.exceptions.WorksheetNotFound:
+            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": "TAB NOT FOUND — check exact name"})
+            continue
         records = ws.get_all_records()
         if not records:
+            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": "Tab found but empty"})
             continue
-        df = pd.DataFrame(records)
+        df = normalize_columns(pd.DataFrame(records))
         if 'Retained/drop\n/move' in df.columns:
             df.rename(columns={'Retained/drop\n/move': 'Retained'}, inplace=True)
         df['course_group'] = course
         frames.append(df)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True, sort=False)
+        load_report.append({"course": course, "tab": ws_name, "rows_found": len(df), "note": "OK"})
+    combined = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    return combined, load_report
 
 
 def extract_period(cohort_name: str) -> str:
@@ -120,7 +194,6 @@ def clean(df: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
 
     df['cohort_start_date'] = pd.to_datetime(col('cohort_start_date'), errors='coerce')
     df['payment_deadline'] = pd.to_datetime(col('Payment\nDeadline'), errors='coerce')
-    # Refund date sometimes MM/DD/YYYY, sometimes ISO — try both
     refund_raw = col('Refund date')
     refund_date = pd.to_datetime(refund_raw, errors='coerce', format='%m/%d/%Y')
     still_na = refund_date.isna() & refund_raw.astype(str).str.strip().ne('')
@@ -150,16 +223,11 @@ def clean(df: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
     return df
 
 
-def week_start_of(d: pd.Timestamp) -> pd.Timestamp:
-    days_since_tue = (d.dayofweek - 1) % 7  # Tue=0
-    return d - pd.Timedelta(days=int(days_since_tue))
-
-
 # ============================================================
 # LOAD + CLEAN
 # ============================================================
 today = pd.Timestamp(datetime.now().date())
-raw = load_raw_from_sheets()
+raw, load_report = load_raw_from_sheets()
 
 if raw.empty:
     st.error(
@@ -167,6 +235,7 @@ if raw.empty:
         "the worksheet names in `WORKSHEET_NAMES`, and that the sheet is shared "
         "with the service account email. See README.md."
     )
+    st.dataframe(pd.DataFrame(load_report))
     st.stop()
 
 df_all = clean(raw, today)
@@ -177,17 +246,21 @@ df_all = clean(raw, today)
 st.sidebar.title("Refund & Retention Review")
 st.sidebar.caption(f"Reference date: {today.date()}  ·  {len(df_all)} learner rows loaded")
 
-mode = st.sidebar.radio("View", ["Weekly", "Monthly"], horizontal=True)
+with st.sidebar.expander("Data health check"):
+    st.dataframe(pd.DataFrame(load_report), hide_index=True, use_container_width=True)
+    st.caption("If a course shows 0 rows or 'not found', its tab name or headers don't match — fix the tab name/header text in the Sheet rather than editing code.")
 
-min_date = df_all['cohort_start_date'].min()
-max_date = df_all['cohort_start_date'].max()
+mode = st.sidebar.radio("View", ["Weekly", "Monthly"], horizontal=True)
 
 if mode == "Weekly":
     days_since_tue_today = (today.dayofweek - 1) % 7
-    default_week_start = (today - pd.Timedelta(days=int(days_since_tue_today) + 7)).date()
-    week_start_input = st.sidebar.date_input("Week starts (Tuesday)", value=default_week_start)
-    range_start = pd.Timestamp(week_start_input)
-    range_end = range_start + pd.Timedelta(days=6)
+    default_start = (today - pd.Timedelta(days=int(days_since_tue_today) + 7)).date()
+    default_end = default_start + timedelta(days=6)
+    c1, c2 = st.sidebar.columns(2)
+    start_input = c1.date_input("Start date", value=default_start)
+    end_input = c2.date_input("End date", value=default_end)
+    range_start = pd.Timestamp(start_input)
+    range_end = pd.Timestamp(end_input)
 else:
     months = sorted(df_all['cohort_start_date'].dt.to_period('M').dropna().unique().astype(str))
     month_sel = st.sidebar.selectbox("Month", months, index=len(months) - 1 if months else 0)
@@ -196,7 +269,6 @@ else:
     range_end = period.end_time
 
 course_sel = st.sidebar.selectbox("Course", ["All"] + sorted(df_all['course_group'].unique().tolist()))
-
 st.sidebar.caption(f"Window: {range_start.date()} – {range_end.date()}")
 
 if st.sidebar.button("🔄 Refresh from Google Sheets"):
@@ -206,19 +278,18 @@ if st.sidebar.button("🔄 Refresh from Google Sheets"):
 use_ai = st.sidebar.toggle("Enable AI insights (OpenAI)", value=bool(st.secrets.get("OPENAI_API_KEY")))
 
 # ============================================================
-# FILTER
+# FILTER — "all data in this timespan" = cohorts that started in-window
+#          OR learners refunded in-window (even if they enrolled earlier)
 # ============================================================
 def in_course(d):
     return d if course_sel == "All" else d[d['course_group'] == course_sel]
 
-scoped = in_course(df_all)
-scoped = scoped[(scoped['cohort_start_date'] >= range_start) & (scoped['cohort_start_date'] <= range_end)]
+base = in_course(df_all)
+in_cohort_window = (base['cohort_start_date'] >= range_start) & (base['cohort_start_date'] <= range_end)
+in_refund_window = base['is_refunded'] & base['refund_date'].notna() & (base['refund_date'] >= range_start) & (base['refund_date'] <= range_end)
+scoped = base[in_cohort_window | in_refund_window]
 
-refund_scoped = in_course(df_all)
-refund_scoped = refund_scoped[
-    refund_scoped['is_refunded'] & refund_scoped['refund_date'].notna() &
-    (refund_scoped['refund_date'] >= range_start) & (refund_scoped['refund_date'] <= range_end)
-]
+refund_scoped = base[base['is_refunded'] & base['refund_date'].notna() & (base['refund_date'] >= range_start) & (base['refund_date'] <= range_end)]
 
 # ============================================================
 # HELPERS: aggregation
@@ -319,12 +390,16 @@ def ai_insight(payload, label="this table", key_suffix=""):
 # HEADER + KPIs
 # ============================================================
 st.title("Refund & Retention Review")
-k1, k2, k3 = st.columns(3)
+
 total = len(scoped)
 refunds = int(scoped['is_refunded'].sum())
-k1.metric("Enrollments in window", total)
-k2.metric("Refunds in window", refunds)
-k3.metric("Refund rate", f"{pct(refunds, total)}%" if total else "—")
+refund_pct = pct(refunds, total)
+cards = [
+    kpi_card("Enrollments in window", total),
+    kpi_card("Refunds in window", refunds, color=RED if (refund_pct or 0) > 15 else NAVY),
+    kpi_card("Refund rate", f"{refund_pct}%" if total else "—", color=ret_color(100 - (refund_pct or 0)) if total else "#9AA3AE"),
+]
+st.markdown(f'<div class="kpi-row">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 tabs = st.tabs([
     "Cohort Summary", "Retention Matrix", "Cohort Calendar", "Refund Sub-categories",
@@ -336,11 +411,16 @@ with tabs[0]:
     st.subheader("Cohort-wise enrollments & refunds")
     data = cohort_summary(scoped)
     st.dataframe(data, use_container_width=True, hide_index=True)
+    if not data.empty:
+        chart_df = scoped.groupby('course_group').agg(
+            Total=('hubspot_id', 'count'), Refunds=('is_refunded', 'sum')
+        ).reset_index().rename(columns={'course_group': 'Course'})
+        chart_long = chart_df.melt(id_vars='Course', value_vars=['Total', 'Refunds'], var_name='Metric', value_name='Count')
+        fig = px.bar(chart_long, x='Course', y='Count', color='Metric', barmode='group',
+                     color_discrete_map={'Total': NAVY, 'Refunds': RED})
+        fig.update_layout(height=340, margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
     ai_insight(data.to_dict('records') if not data.empty else [], "cohort summary", "cohort")
-    with st.expander(f"Show raw data ({len(scoped)} rows)"):
-        st.dataframe(scoped[['hubspot_id', 'course_group', 'cohort_name', 'cohort_start_date',
-                              'payment_category', 'payment_method_clean', 'is_refunded', 'engagement_level']],
-                     use_container_width=True, hide_index=True)
 
 # ---- Retention Matrix ----
 with tabs[1]:
@@ -349,10 +429,14 @@ with tabs[1]:
     st.dataframe(data, use_container_width=True, hide_index=True)
     if not data.empty:
         fig = px.bar(data[data['Category'] == 'All categories'], x='Course', y='Retained %',
-                     color='Retained %', color_continuous_scale=['#C63C3C', '#D6971F', '#1E8E5A'],
-                     range_color=[60, 100])
+                     color='Retained %', color_continuous_scale=[RED, AMBER, GREEN], range_color=[60, 100])
+        fig.update_layout(height=340, margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
     ai_insight(data.to_dict('records') if not data.empty else [], "retention matrix", "retention")
+    with st.expander(f"Show raw data ({len(scoped)} rows)"):
+        st.dataframe(scoped[['hubspot_id', 'course_group', 'cohort_name', 'cohort_start_date',
+                              'payment_category', 'payment_method_clean', 'is_refunded', 'engagement_level']],
+                     use_container_width=True, hide_index=True)
 
 # ---- Cohort Calendar ----
 with tabs[2]:
@@ -382,7 +466,7 @@ with tabs[3]:
         st.markdown("**Open cohorts** _(still in the decision window)_")
         st.dataframe(subcat_counts(src[src['cohort_status'] == 'Open']), use_container_width=True, hide_index=True)
 
-# ---- Refunds Detail (last week / selected window) ----
+# ---- Refunds Detail (selected window) ----
 with tabs[4]:
     st.subheader(f"Refunds processed — detailed reasons  ({range_start.date()} – {range_end.date()})")
     if refund_scoped.empty:
@@ -410,6 +494,7 @@ with tabs[6]:
     st.dataframe(data, use_container_width=True, hide_index=True)
     if not data.empty:
         fig = px.bar(data, x='Method', y='Total', color='Course', barmode='group')
+        fig.update_layout(height=340, margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
     ai_insight(data.to_dict('records') if not data.empty else [], "payment method table", "paymethod")
 
@@ -421,26 +506,44 @@ with tabs[7]:
         st.caption("No data in this window.")
     else:
         courses = sorted(hdf['course'].unique())
-        pivot = hdf.pivot(index='bucket', columns='course', values='retained_pct').reindex(order)
+        pivot_pct = hdf.pivot(index='bucket', columns='course', values='retained_pct').reindex(order)
+        pivot_n = hdf.pivot(index='bucket', columns='course', values='n').reindex(order)
+        pivot_ref = hdf.pivot(index='bucket', columns='course', values='refunded').reindex(order)
+
+        text_matrix = []
+        for bucket in pivot_pct.index:
+            row_text = []
+            for c in pivot_pct.columns:
+                n = pivot_n.loc[bucket, c]
+                p = pivot_pct.loc[bucket, c]
+                r = pivot_ref.loc[bucket, c]
+                if pd.isna(n):
+                    row_text.append("")
+                else:
+                    row_text.append(f"n={int(n)}<br>{p}% retained<br>{int(r)} refunded")
+            text_matrix.append(row_text)
+
         fig = go.Figure(data=go.Heatmap(
-            z=pivot.values, x=pivot.columns, y=pivot.index,
-            colorscale=[[0, '#C63C3C'], [0.5, '#D6971F'], [1, '#1E8E5A']],
-            zmin=0, zmax=100, text=pivot.values, texttemplate="%{text}%",
+            z=pivot_pct.values, x=list(pivot_pct.columns), y=list(pivot_pct.index),
+            colorscale=[[0, RED], [0.5, AMBER], [1, GREEN]], zmin=0, zmax=100,
+            text=text_matrix, texttemplate="%{text}", textfont={"size": 12},
+            hoverinfo='skip', showscale=False,
         ))
-        fig.update_layout(height=450)
+        fig.update_layout(height=480, margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
-        n_pivot = hdf.pivot(index='bucket', columns='course', values='n').reindex(order)
-        st.caption("Cell counts (n):")
-        st.dataframe(n_pivot, use_container_width=True)
+        st.caption("Green = high retention, red = high refund risk. Each cell shows total learners (n), retained %, and refund count for that engagement category.")
 
 st.divider()
 with st.expander("Data notes / known limitations"):
-    st.markdown("""
+    st.markdown(f"""
 - Retention/drop/move column intentionally excluded — pending, will be added later.
 - Course/track is derived from which worksheet a row is in plus its cohort name, since the
   sheet's own free-text Category/Course columns are only populated on refunded rows.
 - **Active Cases** has no dedicated status column in this data — left empty until that source
   is connected.
 - **Closed vs Open** cohort = whether the cohort's payment deadline has passed as of today
-  ({today}).
-""".format(today=today.date()))
+  ({today.date()}).
+- A window's "all data" = cohorts that started in that window, **plus** any learner refunded
+  in that window even if they enrolled earlier — so refund activity is never missed just
+  because the enrollment happened outside the selected dates.
+""")
