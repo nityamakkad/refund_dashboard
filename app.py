@@ -60,6 +60,9 @@ COLUMN_ALIASES = {
     'Current Payment Status': ['current payment status', 'current_payment_status'],
     'Agreement Signed Date': ['agreement signed date'],
     'Month': ['month'],
+    'Retained/Move': ['retained/move', 'retained / move', 'retained/ move', 'retained /move', 'retained_move', 'retained move'],
+    'Starting with AI/IP': ['starting with ai/ip', 'starting with ai / ip', 'starting with ai/ ip', 'starting with ai /ip', 'starting with ai and ip'],
+    'Deal': ['deal'],
 }
 
 NAVY, GREEN, AMBER, RED = "#0B2A4A", "#1E8E5A", "#D6971F", "#C63C3C"
@@ -69,12 +72,13 @@ st.set_page_config(page_title="Refund & Retention Review", layout="wide")
 st.markdown("""
 <style>
 .kpi-row { display:flex; gap:14px; flex-wrap:wrap; margin: 4px 0 20px; }
-.kpi-card { flex:1; min-width:170px; background:#fff; border-radius:12px; padding:16px 20px;
-  border:1px solid #E1E4E9; box-shadow:0 1px 4px rgba(15,42,74,0.07); position:relative; overflow:hidden; }
+.kpi-card { flex:1; min-width:180px; border-radius:14px; padding:18px 20px 16px;
+  border:1px solid #E1E4E9; box-shadow:0 2px 10px rgba(15,42,74,0.08); position:relative; overflow:hidden; }
 .kpi-card:before { content:""; position:absolute; left:0; top:0; bottom:0; width:5px; background:var(--accent,#0B2A4A); }
+.kpi-icon { position:absolute; right:14px; top:12px; font-size:26px; opacity:0.18; }
 .kpi-label { font-size:11px; letter-spacing:.5px; text-transform:uppercase; color:#6B7684; font-weight:700; }
-.kpi-value { font-size:32px; font-weight:800; margin-top:4px; font-variant-numeric:tabular-nums; line-height:1.1; }
-.kpi-sub { font-size:12px; color:#8A93A0; margin-top:3px; }
+.kpi-value { font-size:34px; font-weight:800; margin-top:6px; font-variant-numeric:tabular-nums; line-height:1.1; }
+.kpi-sub { font-size:12px; color:#8A93A0; margin-top:4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -95,9 +99,16 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename_map)
 
 
-def kpi_card(label, value, color=NAVY, sub=""):
+def kpi_card(label, value, color=NAVY, sub="", icon="●"):
     sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
-    return f'<div class="kpi-card" style="--accent:{color}"><div class="kpi-label">{label}</div><div class="kpi-value" style="color:{color}">{value}</div>{sub_html}</div>'
+    bg = f"linear-gradient(135deg, {color}14 0%, #ffffff 65%)"
+    return (
+        f'<div class="kpi-card" style="--accent:{color}; background:{bg}">'
+        f'<div class="kpi-icon">{icon}</div>'
+        f'<div class="kpi-label">{label}</div>'
+        f'<div class="kpi-value" style="color:{color}">{value}</div>'
+        f'{sub_html}</div>'
+    )
 
 
 def ret_color(p):
@@ -243,6 +254,16 @@ def clean(df: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
     df['cohort_name'] = col('cohort_name')
     df['cohort_month'] = col('Month', 'Unknown').replace('', 'Unknown').fillna('Unknown')
 
+    retained_raw = col('Retained/Move', '').fillna('').astype(str).str.strip()
+    df['retained_raw'] = retained_raw.replace('', 'Not Marked')
+    df['is_retained'] = df['retained_raw'] == 'Retained'
+    df['is_moved'] = df['retained_raw'] == 'Move'
+
+    starting_track = col('Starting with AI/IP', '').fillna('').astype(str).str.strip()
+    deal_raw = col('Deal', '').fillna('').astype(str).str.strip()
+    df['starting_track'] = starting_track
+    df['program_segment'] = np.where(deal_raw == '', 'Standalone', 'Edgeup (AI+IP)')
+
     df['period_tag'] = df['cohort_name'].apply(extract_period)
     df['track'] = df.apply(lambda r: extract_track(r['course_group'], r['cohort_name']), axis=1)
 
@@ -270,6 +291,16 @@ if raw.empty:
 
 df_all = clean(raw, today)
 
+# Agentic and LevelUp share "Edgeup" learners who took both AI (Agentic) and IP (LevelUp).
+# Each such learner appears in both course sheets — keep them only under the course they
+# actually STARTED with, so totals aren't double-counted across the two courses.
+_drop_mask = (
+    ((df_all['course_group'] == 'Agentic') & (df_all['starting_track'] == 'IP')) |
+    ((df_all['course_group'] == 'LevelUp') & (df_all['starting_track'] == 'AI'))
+)
+_crossover_removed = int(_drop_mask.sum())
+df_all = df_all[~_drop_mask].copy()
+
 # ============================================================
 # SIDEBAR CONTROLS
 # ============================================================
@@ -279,6 +310,8 @@ st.sidebar.caption(f"Reference date: {today.date()}  ·  {len(df_all)} learner r
 with st.sidebar.expander("Data health check"):
     st.dataframe(pd.DataFrame(load_report), hide_index=True, use_container_width=True)
     st.caption("If a course shows 0 rows or 'not found', its tab name or headers don't match — fix the tab name/header text in the Sheet rather than editing code.")
+    if _crossover_removed:
+        st.caption(f"{_crossover_removed} Edgeup (AI+IP) row(s) excluded from Agentic/LevelUp counts to avoid double-counting learners who took both — kept only under the course they started with.")
 
 mode = st.sidebar.radio("View", ["Weekly", "Monthly"], horizontal=True)
 
@@ -331,15 +364,15 @@ def pct(n, d):
 def retention_matrix(rows, group_col='course_group'):
     out = []
     for g, gdf in rows.groupby(group_col):
-        all_total, all_ref = 0, 0
+        all_total, all_ret, all_ref = 0, 0, 0
         for cat in ['Upfront', 'Non-Upfront', 'Flexipay']:
             c = gdf[gdf['payment_category'] == cat]
-            total, refunded = len(c), int(c['is_refunded'].sum())
-            all_total += total; all_ref += refunded
-            out.append({'Course': g, 'Category': cat, 'Total': total, 'Retained': total - refunded,
-                        'Retained %': pct(total - refunded, total), 'Refunded': refunded, 'Refund %': pct(refunded, total)})
-        out.append({'Course': g, 'Category': 'All categories', 'Total': all_total, 'Retained': all_total - all_ref,
-                    'Retained %': pct(all_total - all_ref, all_total), 'Refunded': all_ref, 'Refund %': pct(all_ref, all_total)})
+            total, retained, refunded = len(c), int(c['is_retained'].sum()), int(c['is_refunded'].sum())
+            all_total += total; all_ret += retained; all_ref += refunded
+            out.append({'Course': g, 'Category': cat, 'Total': total, 'Retained': retained,
+                        'Retained %': pct(retained, total), 'Refunded': refunded, 'Refund %': pct(refunded, total)})
+        out.append({'Course': g, 'Category': 'All categories', 'Total': all_total, 'Retained': all_ret,
+                    'Retained %': pct(all_ret, all_total), 'Refunded': all_ref, 'Refund %': pct(all_ref, all_total)})
     return pd.DataFrame(out)
 
 
@@ -347,9 +380,11 @@ def month_summary(rows):
     out = []
     for (course, month), g in rows.groupby(['course_group', 'cohort_month']):
         up = g[g['payment_category'] == 'Upfront']; fp = g[g['payment_category'] == 'Flexipay']; nu = g[g['payment_category'] == 'Non-Upfront']
+        total = len(g)
         out.append({
             'Course': course, 'Month': month,
-            'Total': len(g), 'Refunds': int(g['is_refunded'].sum()),
+            'Total': total, 'Retained': int(g['is_retained'].sum()), 'Retained %': pct(int(g['is_retained'].sum()), total),
+            'Refunds': int(g['is_refunded'].sum()),
             'Upfront': len(up), 'Upfront Rfd': int(up['is_refunded'].sum()),
             'Flexipay': len(fp), 'Flexipay Rfd': int(fp['is_refunded'].sum()),
             'Non-Upfront': len(nu), 'Non-Upf Rfd': int(nu['is_refunded'].sum()),
@@ -357,12 +392,23 @@ def month_summary(rows):
     return pd.DataFrame(out).sort_values(['Course', 'Month']) if out else pd.DataFrame()
 
 
+def program_segment_table(rows):
+    sub = rows[rows['course_group'].isin(['Agentic', 'LevelUp'])]
+    out = []
+    for (course, segment), g in sub.groupby(['course_group', 'program_segment']):
+        total = len(g)
+        out.append({'Course': course, 'Segment': segment, 'Total': total,
+                    'Retained': int(g['is_retained'].sum()), 'Retained %': pct(int(g['is_retained'].sum()), total),
+                    'Refunded': int(g['is_refunded'].sum())})
+    return pd.DataFrame(out).sort_values(['Course', 'Segment']) if out else pd.DataFrame()
+
+
 def payment_method_table(rows):
     out = []
     for (course, method), g in rows.groupby(['course_group', 'payment_method_clean']):
-        refunded = int(g['is_refunded'].sum())
-        out.append({'Course': course, 'Method': method, 'Total': len(g), 'Retained': len(g) - refunded,
-                    'Retained %': pct(len(g) - refunded, len(g)), 'Refunded': refunded})
+        total = len(g)
+        out.append({'Course': course, 'Method': method, 'Total': total, 'Retained': int(g['is_retained'].sum()),
+                    'Retained %': pct(int(g['is_retained'].sum()), total), 'Refunded': int(g['is_refunded'].sum())})
     return pd.DataFrame(out).sort_values(['Course', 'Total'], ascending=[True, False]) if out else pd.DataFrame()
 
 
@@ -370,8 +416,8 @@ def heatmap_data(rows):
     order = ["All 3", "Orientation & F", "O & F", "O & O", "First Class", "Orientation", "Onboarding", "None", "Unknown"]
     out = []
     for (course, bucket), g in rows.groupby(['course_group', 'risk_bucket']):
-        refunded = int(g['is_refunded'].sum())
-        out.append({'course': course, 'bucket': bucket, 'n': len(g), 'retained_pct': pct(len(g) - refunded, len(g)), 'refunded': refunded})
+        total = len(g)
+        out.append({'course': course, 'bucket': bucket, 'n': total, 'retained_pct': pct(int(g['is_retained'].sum()), total), 'refunded': int(g['is_refunded'].sum())})
     return pd.DataFrame(out), order
 
 
@@ -420,11 +466,14 @@ st.title("Refund & Retention Review")
 
 total = len(scoped)
 refunds = int(scoped['is_refunded'].sum())
+retained = int(scoped['is_retained'].sum())
 refund_pct = pct(refunds, total)
+retained_pct_kpi = pct(retained, total)
 cards = [
-    kpi_card("Enrollments in window", total),
-    kpi_card("Refunds in window", refunds, color=RED if (refund_pct or 0) > 15 else NAVY),
-    kpi_card("Refund rate", f"{refund_pct}%" if total else "—", color=ret_color(100 - (refund_pct or 0)) if total else "#9AA3AE"),
+    kpi_card("Enrollments in window", total, icon="👥"),
+    kpi_card("Retained", retained, color=ret_color(retained_pct_kpi) if total else NAVY, sub=f"{retained_pct_kpi}% of window" if total else "", icon="✅"),
+    kpi_card("Refunds in window", refunds, color=RED if (refund_pct or 0) > 15 else NAVY, icon="💸"),
+    kpi_card("Refund rate", f"{refund_pct}%" if total else "—", color=ret_color(100 - (refund_pct or 0)) if total else "#9AA3AE", icon="📉"),
 ]
 st.markdown(f'<div class="kpi-row">{"".join(cards)}</div>', unsafe_allow_html=True)
 
@@ -460,9 +509,16 @@ with tabs[1]:
         fig.update_layout(height=340, margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
     ai_insight(data.to_dict('records') if not data.empty else [], "retention matrix", "retention")
+
+    seg = program_segment_table(scoped)
+    if not seg.empty:
+        st.markdown("**Program segment — Agentic & LevelUp** _(Standalone vs. Edgeup learners who took both AI + IP, counted only under the program they started with)_")
+        st.dataframe(seg, use_container_width=True, hide_index=True)
+
     with st.expander(f"Show raw data ({len(scoped)} rows)"):
         st.dataframe(scoped[['hubspot_id', 'course_group', 'cohort_name', 'cohort_start_date',
-                              'payment_category', 'payment_method_clean', 'is_refunded', 'engagement_level']],
+                              'payment_category', 'payment_method_clean', 'retained_raw', 'is_refunded',
+                              'program_segment', 'starting_track', 'engagement_level']],
                      use_container_width=True, hide_index=True)
 
 # ---- Cohort Calendar ----
@@ -563,7 +619,12 @@ with tabs[7]:
 st.divider()
 with st.expander("Data notes / known limitations"):
     st.markdown(f"""
-- Retention/drop/move column intentionally excluded — pending, will be added later.
+- **Retained** now comes from the sheet's own `Retained/Move` column — "Retained" counts as retained;
+  "No" and "Move" both count as not retained (a Move means the learner left that cohort, so it's treated
+  the same as a drop even though it isn't a formal refund).
+- **Agentic/LevelUp crossover**: learners who did both AI and IP (Edgeup) are counted only once, under
+  whichever program they started with — {_crossover_removed} duplicate row(s) were excluded this load.
+  See the sidebar Data health check for the current count.
 - Course/track is derived from which worksheet a row is in plus its cohort name, since the
   sheet's own free-text Category/Course columns are only populated on refunded rows.
 - **Active Cases** has no dedicated status column in this data — left empty until that source
