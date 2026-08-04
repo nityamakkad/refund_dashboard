@@ -59,6 +59,7 @@ COLUMN_ALIASES = {
     'Refund \nJourney Stage': ['refund journey stage', 'refund_journey_stage'],
     'Current Payment Status': ['current payment status', 'current_payment_status'],
     'Agreement Signed Date': ['agreement signed date'],
+    'Month': ['month'],
 }
 
 NAVY, GREEN, AMBER, RED = "#0B2A4A", "#1E8E5A", "#D6971F", "#C63C3C"
@@ -122,6 +123,20 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
+def dedupe_columns(cols):
+    seen = {}
+    out = []
+    for c in cols:
+        c = str(c).strip() if str(c).strip() else "Unnamed"
+        if c in seen:
+            seen[c] += 1
+            out.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0
+            out.append(c)
+    return out
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Reading latest data from Google Sheets...")
 def load_raw_from_sheets():
     client = get_gspread_client()
@@ -133,13 +148,27 @@ def load_raw_from_sheets():
         try:
             ws = sh.worksheet(ws_name)
         except gspread.exceptions.WorksheetNotFound:
-            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": "TAB NOT FOUND — check exact name"})
+            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": "TAB NOT FOUND — check exact tab name (case/spacing matters)"})
             continue
-        records = ws.get_all_records()
-        if not records:
-            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": "Tab found but empty"})
+        try:
+            values = ws.get_all_values()  # raw grid — avoids gspread's duplicate-header crash
+        except Exception as e:
+            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": f"ERROR reading tab: {e}"})
             continue
-        df = normalize_columns(pd.DataFrame(records))
+        if len(values) < 2:
+            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": "Tab found but has no data rows"})
+            continue
+        headers = dedupe_columns(values[0])
+        body = values[1:]
+        # pad/truncate rows to header length so ragged rows don't crash the DataFrame build
+        body = [r + [""] * (len(headers) - len(r)) if len(r) < len(headers) else r[:len(headers)] for r in body]
+        try:
+            df = pd.DataFrame(body, columns=headers)
+        except Exception as e:
+            load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": f"ERROR building table: {e}"})
+            continue
+        df = df[~(df.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]  # drop fully-blank rows
+        df = normalize_columns(df)
         if 'Retained/drop\n/move' in df.columns:
             df.rename(columns={'Retained/drop\n/move': 'Retained'}, inplace=True)
         df['course_group'] = course
@@ -212,6 +241,7 @@ def clean(df: pd.DataFrame, reference_date: pd.Timestamp) -> pd.DataFrame:
     df['current_payment_status'] = col('Current Payment Status')
     df['hubspot_id'] = col('hubspot_id')
     df['cohort_name'] = col('cohort_name')
+    df['cohort_month'] = col('Month', 'Unknown').replace('', 'Unknown').fillna('Unknown')
 
     df['period_tag'] = df['cohort_name'].apply(extract_period)
     df['track'] = df.apply(lambda r: extract_track(r['course_group'], r['cohort_name']), axis=1)
@@ -313,21 +343,18 @@ def retention_matrix(rows, group_col='course_group'):
     return pd.DataFrame(out)
 
 
-def cohort_summary(rows):
+def month_summary(rows):
     out = []
-    for (course, cohort), g in rows.groupby(['course_group', 'cohort_name']):
+    for (course, month), g in rows.groupby(['course_group', 'cohort_month']):
         up = g[g['payment_category'] == 'Upfront']; fp = g[g['payment_category'] == 'Flexipay']; nu = g[g['payment_category'] == 'Non-Upfront']
         out.append({
-            'Course': course, 'Cohort': cohort,
-            'Start': g['cohort_start_date'].iloc[0].date() if pd.notna(g['cohort_start_date'].iloc[0]) else None,
-            'Deadline': g['payment_deadline'].iloc[0].date() if pd.notna(g['payment_deadline'].iloc[0]) else None,
-            'Status': g['cohort_status'].iloc[0],
+            'Course': course, 'Month': month,
             'Total': len(g), 'Refunds': int(g['is_refunded'].sum()),
             'Upfront': len(up), 'Upfront Rfd': int(up['is_refunded'].sum()),
             'Flexipay': len(fp), 'Flexipay Rfd': int(fp['is_refunded'].sum()),
             'Non-Upfront': len(nu), 'Non-Upf Rfd': int(nu['is_refunded'].sum()),
         })
-    return pd.DataFrame(out).sort_values('Start') if out else pd.DataFrame()
+    return pd.DataFrame(out).sort_values(['Course', 'Month']) if out else pd.DataFrame()
 
 
 def payment_method_table(rows):
@@ -406,10 +433,10 @@ tabs = st.tabs([
     "Refunds — Detail", "Active Cases", "Payment Method", "Engagement Heatmap",
 ])
 
-# ---- Cohort Summary ----
+# ---- Cohort Summary (by month) ----
 with tabs[0]:
-    st.subheader("Cohort-wise enrollments & refunds")
-    data = cohort_summary(scoped)
+    st.subheader("Month-wise enrollments & refunds")
+    data = month_summary(scoped)
     st.dataframe(data, use_container_width=True, hide_index=True)
     if not data.empty:
         chart_df = scoped.groupby('course_group').agg(
