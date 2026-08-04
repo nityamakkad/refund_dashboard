@@ -436,8 +436,39 @@ def heatmap_data_by_course(rows, course):
 
 
 def subcat_counts(rows):
-    vc = rows['refund_category'].fillna('Uncategorized').value_counts()
-    return pd.DataFrame({'Sub-category': vc.index, 'Count': vc.values})
+    if rows.empty:
+        return pd.DataFrame(columns=['Course', 'Sub-category', 'Count'])
+    r = rows.copy()
+    r['refund_category'] = r['refund_category'].fillna('Uncategorized')
+    vc = r.groupby(['course_group', 'refund_category']).size().reset_index(name='Count')
+    vc.columns = ['Course', 'Sub-category', 'Count']
+    return vc.sort_values(['Course', 'Count'], ascending=[True, False])
+
+
+def refund_method_reason_table(rows):
+    ref = rows[rows['is_refunded']].copy()
+    if ref.empty:
+        return pd.DataFrame()
+    ref['refund_category'] = ref['refund_category'].fillna('Uncategorized')
+    vc = ref.groupby(['course_group', 'payment_method_clean', 'refund_category']).size().reset_index(name='Refunds')
+    vc.columns = ['Course', 'Payment Method', 'Refund Sub-category', 'Refunds']
+    return vc.sort_values(['Course', 'Payment Method', 'Refunds'], ascending=[True, True, False])
+
+
+def stage_refund_table(rows):
+    ref = rows[rows['is_refunded']].copy()
+    if ref.empty:
+        return pd.DataFrame()
+    ref['refund_journey_stage'] = ref['refund_journey_stage'].fillna('Unknown')
+    out = []
+    for (course, stage), g in ref.groupby(['course_group', 'refund_journey_stage']):
+        out.append({'Course': course, 'Stage': stage, 'Refunds': len(g)})
+    df = pd.DataFrame(out)
+    if df.empty:
+        return df
+    totals = df.groupby('Course')['Refunds'].transform('sum')
+    df['% of course refunds'] = (100 * df['Refunds'] / totals).round(1)
+    return df.sort_values(['Course', 'Refunds'], ascending=[True, False])
 
 
 # ============================================================
@@ -606,6 +637,13 @@ with tabs[4]:
         st.dataframe(detail, use_container_width=True, hide_index=True)
         ai_insight(detail.drop(columns=['Reason']).to_dict('records'), "this week's refunds", "lastweek")
 
+    st.markdown("**Refunds by course & journey stage**")
+    stage_df = stage_refund_table(refund_scoped)
+    if stage_df.empty:
+        st.caption("No refunds in this window.")
+    else:
+        st.dataframe(stage_df, use_container_width=True, hide_index=True)
+
 # ---- Active Cases (placeholder — separate data source pending) ----
 with tabs[5]:
     st.subheader("Active cases")
@@ -621,11 +659,10 @@ with tabs[6]:
     if data.empty:
         st.caption("No data in this window.")
     else:
-        cols = st.columns(2)
-        for i, course in enumerate(COURSES):
-            sub = data[data['Course'] == course].drop(columns='Course')
-            with cols[i % 2]:
-                st.markdown(f"**{course}**")
+        course_tabs = st.tabs(COURSES)
+        for course, ctab in zip(COURSES, course_tabs):
+            with ctab:
+                sub = data[data['Course'] == course].drop(columns='Course')
                 if sub.empty:
                     st.caption("No data in this window.")
                 else:
@@ -634,6 +671,13 @@ with tabs[6]:
         fig.update_layout(height=340, margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
     ai_insight(data.to_dict('records') if not data.empty else [], "payment method table", "paymethod")
+
+    st.markdown("**Refunds — course × payment method × reason sub-category**")
+    mr = refund_method_reason_table(scoped)
+    if mr.empty:
+        st.caption("No refunds in this window.")
+    else:
+        st.dataframe(mr, use_container_width=True, hide_index=True)
 
 # ---- Engagement Heatmap ----
 with tabs[7]:
@@ -656,16 +700,16 @@ with tabs[7]:
                 n = pivot_n.loc[bucket, m]
                 p = pivot_pct.loc[bucket, m]
                 r = pivot_ref.loc[bucket, m]
-                row_text.append("" if pd.isna(n) else f"n={int(n)}<br>{p}% retained<br>{int(r)} refunded")
+                row_text.append("" if pd.isna(n) else f"n={int(n)}<br><b>{p}% retained</b><br>{int(r)} refunded")
             text_matrix.append(row_text)
 
         fig = go.Figure(data=go.Heatmap(
             z=pivot_pct.values, x=list(pivot_pct.columns), y=list(pivot_pct.index),
             colorscale=HEAT_SCALE, zmin=0, zmax=100,
-            text=text_matrix, texttemplate="%{text}", textfont={"size": 11},
+            text=text_matrix, texttemplate="%{text}", textfont={"size": 10, "color": "white"},
             hoverinfo='skip', showscale=False,
         ))
-        fig.update_layout(height=max(320, 55 * len(pivot_pct.index)), margin=dict(t=30, b=10), title=course)
+        fig.update_layout(height=max(220, 34 * len(pivot_pct.index)), margin=dict(t=30, b=10, l=10, r=10), title=course)
         st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
