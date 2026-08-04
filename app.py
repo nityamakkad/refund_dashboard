@@ -631,9 +631,9 @@ with tabs[4]:
         st.caption("No refunds with a refund date in this window.")
     else:
         detail = refund_scoped[['course_group', 'cohort_name', 'refund_date', 'refund_category',
-                                 'payment_method_clean', 'refund_journey_stage', 'refund_reason']].copy()
+                                 'payment_method_clean', 'refund_journey_stage', 'engagement_level', 'refund_reason']].copy()
         detail['refund_date'] = detail['refund_date'].dt.date
-        detail.columns = ['Course', 'Cohort', 'Refund Date', 'Category', 'Payment Method', 'Stage', 'Reason']
+        detail.columns = ['Course', 'Cohort', 'Refund Date', 'Category', 'Payment Method', 'Stage', 'Engagement', 'Reason']
         st.dataframe(detail, use_container_width=True, hide_index=True)
         ai_insight(detail.drop(columns=['Reason']).to_dict('records'), "this week's refunds", "lastweek")
 
@@ -709,8 +709,10 @@ with tabs[7]:
             text=text_matrix, texttemplate="%{text}", textfont={"size": 10, "color": "white"},
             hoverinfo='skip', showscale=False,
         ))
-        fig.update_layout(height=max(220, 34 * len(pivot_pct.index)), margin=dict(t=30, b=10, l=10, r=10), title=course)
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(height=max(320, 52 * len(pivot_pct.index)), margin=dict(t=30, b=10, l=10, r=10), title=course)
+        narrow_col, _ = st.columns([3, 1])
+        with narrow_col:
+            st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 with st.expander("Data notes / known limitations"):
