@@ -379,17 +379,27 @@ def retention_matrix(rows, group_col='course_group'):
 def month_summary(rows):
     out = []
     for (course, month), g in rows.groupby(['course_group', 'cohort_month']):
-        up = g[g['payment_category'] == 'Upfront']; fp = g[g['payment_category'] == 'Flexipay']; nu = g[g['payment_category'] == 'Non-Upfront']
         total = len(g)
         out.append({
-            'Course': course, 'Month': month,
-            'Total': total, 'Retained': int(g['is_retained'].sum()), 'Retained %': pct(int(g['is_retained'].sum()), total),
-            'Refunds': int(g['is_refunded'].sum()),
-            'Upfront': len(up), 'Upfront Rfd': int(up['is_refunded'].sum()),
-            'Flexipay': len(fp), 'Flexipay Rfd': int(fp['is_refunded'].sum()),
-            'Non-Upfront': len(nu), 'Non-Upf Rfd': int(nu['is_refunded'].sum()),
+            'Course': course, 'Month': month, 'Total': total,
+            'Retained': int(g['is_retained'].sum()), 'Retained %': pct(int(g['is_retained'].sum()), total),
+            'Refunds': int(g['is_refunded'].sum()), 'Refund %': pct(int(g['is_refunded'].sum()), total),
         })
     return pd.DataFrame(out).sort_values(['Course', 'Month']) if out else pd.DataFrame()
+
+
+def month_category_breakdown(rows):
+    out = []
+    for (course, month, cat), g in rows.groupby(['course_group', 'cohort_month', 'payment_category']):
+        if cat not in ('Upfront', 'Flexipay', 'Non-Upfront'):
+            continue
+        total = len(g)
+        out.append({
+            'Course': course, 'Month': month, 'Category': cat, 'Total': total,
+            'Retained': int(g['is_retained'].sum()), 'Retained %': pct(int(g['is_retained'].sum()), total),
+            'Refunded': int(g['is_refunded'].sum()), 'Refund %': pct(int(g['is_refunded'].sum()), total),
+        })
+    return pd.DataFrame(out).sort_values(['Course', 'Month', 'Category']) if out else pd.DataFrame()
 
 
 def program_segment_table(rows):
@@ -487,15 +497,33 @@ with tabs[0]:
     st.subheader("Month-wise enrollments & refunds")
     data = month_summary(scoped)
     st.dataframe(data, use_container_width=True, hide_index=True)
-    if not data.empty:
+
+    st.markdown("**Payment category breakdown** _(Upfront / Flexipay / Non-Upfront, month-wise)_")
+    cat_data = month_category_breakdown(scoped)
+    st.dataframe(cat_data, use_container_width=True, hide_index=True)
+
+    if not scoped.empty:
         chart_df = scoped.groupby('course_group').agg(
-            Total=('hubspot_id', 'count'), Refunds=('is_refunded', 'sum')
+            Total=('hubspot_id', 'count'), Refunds=('is_refunded', 'sum'), Retained=('is_retained', 'sum')
         ).reset_index().rename(columns={'course_group': 'Course'})
-        chart_long = chart_df.melt(id_vars='Course', value_vars=['Total', 'Refunds'], var_name='Metric', value_name='Count')
-        fig = px.bar(chart_long, x='Course', y='Count', color='Metric', barmode='group',
-                     color_discrete_map={'Total': NAVY, 'Refunds': RED})
-        fig.update_layout(height=340, margin=dict(t=10, b=10))
+        chart_df['Retained %'] = (100 * chart_df['Retained'] / chart_df['Total']).round(1)
+
+        fig = go.Figure()
+        fig.add_bar(x=chart_df['Course'], y=chart_df['Total'], name='Total', marker_color=NAVY)
+        fig.add_bar(x=chart_df['Course'], y=chart_df['Refunds'], name='Refunds', marker_color=RED)
+        fig.add_trace(go.Scatter(
+            x=chart_df['Course'], y=chart_df['Retained %'], name='Retained %', mode='lines+markers+text',
+            text=[f"{v}%" for v in chart_df['Retained %']], textposition='top center',
+            yaxis='y2', line=dict(color=GREEN, width=3), marker=dict(size=9),
+        ))
+        fig.update_layout(
+            barmode='group', height=380, margin=dict(t=30, b=10),
+            yaxis=dict(title='Count'),
+            yaxis2=dict(title='Retained %', overlaying='y', side='right', range=[0, 105], showgrid=False),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
         st.plotly_chart(fig, use_container_width=True)
+
     ai_insight(data.to_dict('records') if not data.empty else [], "cohort summary", "cohort")
 
 # ---- Retention Matrix ----
