@@ -179,11 +179,16 @@ def load_raw_from_sheets():
         except Exception as e:
             load_report.append({"course": course, "tab": ws_name, "rows_found": 0, "note": f"ERROR building table: {e}"})
             continue
+        # Payment method always comes from column I (index 8), by position — not by header
+        # text — since header wording for this column isn't consistent across tabs.
+        payment_mode_col_I = df.iloc[:, 8].copy() if df.shape[1] > 8 else None
         df = df[~(df.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1))]  # drop fully-blank rows
         df = normalize_columns(df)
         if 'Retained/drop\n/move' in df.columns:
             df.rename(columns={'Retained/drop\n/move': 'Retained'}, inplace=True)
         df['course_group'] = course
+        if payment_mode_col_I is not None:
+            df['Payment Mode'] = payment_mode_col_I.loc[df.index]
         frames.append(df)
         load_report.append({"course": course, "tab": ws_name, "rows_found": len(df), "note": "OK"})
     combined = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
