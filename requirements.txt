@@ -1,7 +1,0 @@
-streamlit>=1.35
-pandas>=2.0
-numpy>=1.24
-plotly>=5.20
-gspread>=6.0
-google-auth>=2.28
-openai>=1.30
