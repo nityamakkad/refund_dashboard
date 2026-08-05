@@ -300,15 +300,16 @@ if raw.empty:
 
 df_all = clean(raw, today)
 
-# Agentic and LevelUp share "Edgeup" learners who took both AI (Agentic) and IP (LevelUp).
-# Each such learner appears in both course sheets — keep them only under the course they
-# actually STARTED with, so totals aren't double-counted across the two courses.
-_drop_mask = (
-    ((df_all['course_group'] == 'Agentic') & (df_all['starting_track'] == 'IP')) |
-    ((df_all['course_group'] == 'LevelUp') & (df_all['starting_track'] == 'AI'))
+# Course scope (not a dedup step — each course's own rule):
+#   Agentic  -> only learners who started with AI
+#   LevelUp  -> only learners who started with IP
+#   FDE, Switch-Up -> full list, no filter
+_course_scope_mask = (
+    ((df_all['course_group'] == 'Agentic') & (df_all['starting_track'] == 'AI')) |
+    ((df_all['course_group'] == 'LevelUp') & (df_all['starting_track'] == 'IP')) |
+    (df_all['course_group'].isin(['FDE', 'Switch-Up']))
 )
-_crossover_removed = int(_drop_mask.sum())
-df_all = df_all[~_drop_mask].copy()
+df_all = df_all[_course_scope_mask].copy()
 
 # ============================================================
 # SIDEBAR CONTROLS
@@ -319,8 +320,7 @@ st.sidebar.caption(f"Reference date: {today.date()}  ·  {len(df_all)} learner r
 with st.sidebar.expander("Data health check"):
     st.dataframe(pd.DataFrame(load_report), hide_index=True, use_container_width=True)
     st.caption("If a course shows 0 rows or 'not found', its tab name or headers don't match — fix the tab name/header text in the Sheet rather than editing code.")
-    if _crossover_removed:
-        st.caption(f"{_crossover_removed} Edgeup (AI+IP) row(s) excluded from Agentic/LevelUp counts to avoid double-counting learners who took both — kept only under the course they started with.")
+    st.caption("Course scope: Agentic = learners who started with AI only. LevelUp = learners who started with IP only. FDE and Switch-Up = full list, no filter.")
     st.markdown("**Raw payment method values (column I), by course**")
     pm_check = df_all.groupby(['course_group', 'payment_method_raw']).size().reset_index(name='rows')
     pm_check = pm_check.sort_values(['course_group', 'rows'], ascending=[True, False])
@@ -537,7 +537,7 @@ st.markdown(f'<div class="kpi-row">{"".join(cards)}</div>', unsafe_allow_html=Tr
 
 tabs = st.tabs([
     "Cohort Summary", "Category Breakdown", "Trial Window (Refunds)", "Refund Sub-categories",
-    "Refunds — Detail", "Active Cases", "Payment Method", "Engagement Heatmap",
+    "Refunds — Detail", "Active Cases", "Payment Method", "Engagement Heatmap", "Cohort Composition",
 ])
 
 # ---- Cohort Summary (by month) ----
@@ -727,15 +727,61 @@ with tabs[7]:
         with narrow_col:
             st.plotly_chart(fig, use_container_width=True)
 
+# ---- Cohort Composition (treemap: enrollment size + payment mix) ----
+with tabs[8]:
+    st.subheader("Cohort composition — enrollment size & payment mix")
+    st.caption(
+        "Box size = total learners in that cohort. Color = payment category. "
+        "Click a course or cohort to zoom in; click the center breadcrumb to zoom back out."
+    )
+    if scoped.empty:
+        st.caption("No data in this window.")
+    else:
+        tdata = scoped.groupby(['course_group', 'cohort_name', 'payment_category']).size().reset_index(name='Learners')
+        fig = px.treemap(
+            tdata,
+            path=[px.Constant("All Courses"), 'course_group', 'cohort_name', 'payment_category'],
+            values='Learners',
+            color='payment_category',
+            color_discrete_map={'Upfront': NAVY, 'Flexipay': AMBER, 'Non-Upfront': GREEN, '(?)': '#D9D9D9'},
+        )
+        fig.update_traces(
+            textinfo="label+value+percent parent",
+            marker=dict(cornerradius=6, line=dict(width=1, color='white')),
+            root_color="#F5F6F8",
+        )
+        fig.update_layout(height=650, margin=dict(t=10, b=10, l=10, r=10), font=dict(size=13))
+        st.plotly_chart(fig, use_container_width=True)
+
+        legend_cols = st.columns(3)
+        for col, (label, color) in zip(legend_cols, [("Upfront", NAVY), ("Flexipay", AMBER), ("Non-Upfront", GREEN)]):
+            col.markdown(f'<div style="display:flex;align-items:center;gap:8px;"><div style="width:14px;height:14px;border-radius:4px;background:{color};"></div><span style="font-size:13px;">{label}</span></div>', unsafe_allow_html=True)
+
+        with st.expander("Show exact numbers per cohort"):
+            comp_rows = []
+            for (course, cohort), g in scoped.groupby(['course_group', 'cohort_name']):
+                total = len(g)
+                up = int((g['payment_category'] == 'Upfront').sum())
+                fp = int((g['payment_category'] == 'Flexipay').sum())
+                nu = int((g['payment_category'] == 'Non-Upfront').sum())
+                comp_rows.append({
+                    'Course': course, 'Cohort': cohort, 'Total Enrolled': total,
+                    'Upfront': up, 'Upfront %': pct(up, total),
+                    'Flexipay': fp, 'Flexipay %': pct(fp, total),
+                    'Non-Upfront': nu, 'Non-Upfront %': pct(nu, total),
+                })
+            comp_df = pd.DataFrame(comp_rows).sort_values(['Course', 'Cohort']) if comp_rows else pd.DataFrame()
+            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
 st.divider()
 with st.expander("Data notes / known limitations"):
     st.markdown(f"""
 - **Retained** now comes from the sheet's own `Retained/Move` column — "Retained" counts as retained;
   "No" and "Move" both count as not retained (a Move means the learner left that cohort, so it's treated
   the same as a drop even though it isn't a formal refund).
-- **Agentic/LevelUp crossover**: learners who did both AI and IP (Edgeup) are counted only once, under
-  whichever program they started with — {_crossover_removed} duplicate row(s) were excluded this load.
-  See the sidebar Data health check for the current count.
+- **Agentic** only includes learners who started with AI; **LevelUp** only includes learners who started
+  with IP. FDE and Switch-Up show the full list. This is a per-course scope, not a cross-course dedup —
+  see the sidebar Data health check.
 - Course/track is derived from which worksheet a row is in plus its cohort name, since the
   sheet's own free-text Category/Course columns are only populated on refunded rows.
 - **Active Cases** has no dedicated status column in this data — left empty until that source
